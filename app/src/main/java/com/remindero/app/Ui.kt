@@ -1,12 +1,16 @@
 package com.remindero.app
 
-import com.google.android.gms.location.CurrentLocationRequest
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
 import android.content.pm.PackageManager
 import android.location.Location
+import android.location.LocationListener
+import android.location.LocationManager
 import android.os.Build
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -62,44 +66,92 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import com.google.android.gms.location.CurrentLocationRequest
 import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
 import com.google.android.gms.tasks.CancellationTokenSource
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
+/**
+ * Obtiene la ubicación actual SIN quedarse colgado:
+ *  - usa una ubicación guardada reciente si existe,
+ *  - si no, pide a Google (si está disponible) y al GPS/red de Android a la vez,
+ *  - toma lo primero que responda,
+ *  - a los 30 s termina sí o sí (con la última ubicación conocida o null).
+ */
 @SuppressLint("MissingPermission")
 fun fetchLocation(ctx: Context, onResult: (Location?) -> Unit) {
-    @SuppressLint("MissingPermission")
-fun fetchLocation(ctx: Context, onResult: (Location?) -> Unit) {
-    val client = LocationServices.getFusedLocationProviderClient(ctx)
+    val handler = Handler(Looper.getMainLooper())
+    val lm = ctx.getSystemService(Context.LOCATION_SERVICE) as LocationManager
+    val listeners = mutableListOf<LocationListener>()
+    val token = CancellationTokenSource()
+    var finished = false
 
-    fun tryLast() {
-        client.lastLocation
-            .addOnSuccessListener { onResult(it) }
-            .addOnFailureListener { onResult(null) }
+    fun bestLastKnown(): Location? {
+        var best: Location? = null
+        for (p in lm.getProviders(true)) {
+            val l = try { lm.getLastKnownLocation(p) } catch (e: Exception) { null }
+            if (l != null && (best == null || l.time > best.time)) best = l
+        }
+        return best
     }
 
-    fun tryBalanced() {
+    fun finish(loc: Location?) {
+        if (finished) return
+        finished = true
+        handler.removeCallbacksAndMessages(null)
+        try { token.cancel() } catch (e: Exception) { }
+        for (l in listeners) {
+            try { lm.removeUpdates(l) } catch (e: Exception) { }
+        }
+        onResult(loc)
+    }
+
+    // Sin ningún proveedor de ubicación activo: avisa de inmediato
+    if (lm.getProviders(true).isEmpty()) {
+        finish(null)
+        return
+    }
+
+    // Ubicación guardada de hace menos de 5 minutos: úsala al instante
+    val cached = bestLastKnown()
+    if (cached != null && System.currentTimeMillis() - cached.time < 5 * 60_000) {
+        finish(cached)
+        return
+    }
+
+    // Opción 1: Google (si está disponible)
+    try {
         val req = CurrentLocationRequest.Builder()
-            .setPriority(Priority.PRIORITY_BALANCED_POWER_ACCURACY)
-            .setDurationMillis(10000)
-            .setMaxUpdateAgeMillis(120000)
+            .setPriority(Priority.PRIORITY_HIGH_ACCURACY)
+            .setDurationMillis(20000)
+            .setMaxUpdateAgeMillis(60000)
             .build()
-        client.getCurrentLocation(req, CancellationTokenSource().token)
-            .addOnSuccessListener { loc -> if (loc != null) onResult(loc) else tryLast() }
-            .addOnFailureListener { tryLast() }
+        LocationServices.getFusedLocationProviderClient(ctx)
+            .getCurrentLocation(req, token.token)
+            .addOnSuccessListener { loc -> if (loc != null) finish(loc) }
+    } catch (e: Exception) { }
+
+    // Opción 2: GPS y red del propio Android
+    for (p in listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)) {
+        try {
+            if (lm.isProviderEnabled(p)) {
+                val l = object : LocationListener {
+                    override fun onLocationChanged(location: Location) { finish(location) }
+                    @Deprecated("Deprecated in Java")
+                    override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
+                    override fun onProviderEnabled(provider: String) {}
+                    override fun onProviderDisabled(provider: String) {}
+                }
+                listeners.add(l)
+                lm.requestLocationUpdates(p, 0L, 0f, l, Looper.getMainLooper())
+            }
+        } catch (e: Exception) { }
     }
 
-    val req = CurrentLocationRequest.Builder()
-        .setPriority(Priority.PRIORITY_HIGH_ACCURACY)
-        .setDurationMillis(15000)
-        .setMaxUpdateAgeMillis(60000)
-        .build()
-    client.getCurrentLocation(req, CancellationTokenSource().token)
-        .addOnSuccessListener { loc -> if (loc != null) onResult(loc) else tryBalanced() }
-        .addOnFailureListener { tryBalanced() }
-}
+    // Tiempo límite: nunca se queda colgado
+    handler.postDelayed({ finish(bestLastKnown()) }, 30000)
 }
 
 private fun hasFineLocation(ctx: Context) =
@@ -124,6 +176,7 @@ fun RemindEroApp() {
     var centerLat by remember { mutableStateOf(prefs.centerLat) }
     var centerLon by remember { mutableStateOf(prefs.centerLon) }
     var locating by remember { mutableStateOf(false) }
+    var manualText by remember { mutableStateOf("") }
     var afterPerm by remember { mutableStateOf<(() -> Unit)?>(null) }
 
     val launcher = rememberLauncherForActivityResult(
@@ -154,20 +207,44 @@ fun RemindEroApp() {
         }
     }
 
+    fun saveCenter(lat: Double, lon: Double) {
+        prefs.centerLat = lat
+        prefs.centerLon = lon
+        prefs.hasCenter = true
+        centerLat = lat
+        centerLon = lon
+        hasCenter = true
+    }
+
     fun setCenterHere() = withPermissions {
         locating = true
         fetchLocation(ctx) { loc ->
             locating = false
             if (loc == null) {
-                Toast.makeText(ctx, "No pude obtener tu ubicación. ¿Está el GPS encendido?", Toast.LENGTH_LONG).show()
+                Toast.makeText(
+                    ctx,
+                    "No pude obtener tu ubicación. Prueba afuera o pega las coordenadas a mano 👇",
+                    Toast.LENGTH_LONG
+                ).show()
             } else {
-                prefs.centerLat = loc.latitude
-                prefs.centerLon = loc.longitude
-                prefs.hasCenter = true
-                centerLat = loc.latitude
-                centerLon = loc.longitude
-                hasCenter = true
+                saveCenter(loc.latitude, loc.longitude)
             }
+        }
+    }
+
+    fun saveManual() {
+        val parts = manualText.replace("°", "")
+            .split(",", ";", " ")
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+        val lat = parts.getOrNull(0)?.toDoubleOrNull()
+        val lon = parts.getOrNull(1)?.toDoubleOrNull()
+        if (lat == null || lon == null || lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0) {
+            Toast.makeText(ctx, "Formato inválido. Ejemplo: 25.5428, -103.4068", Toast.LENGTH_LONG).show()
+        } else {
+            saveCenter(lat, lon)
+            manualText = ""
+            Toast.makeText(ctx, "Centro guardado ✅", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -246,8 +323,23 @@ fun RemindEroApp() {
                             modifier = Modifier.fillMaxWidth(),
                             shape = RoundedCornerShape(14.dp)
                         ) {
-                            Text(if (locating) "Buscando ubicación…" else "Usar mi ubicación actual")
+                            Text(if (locating) "Buscando ubicación… (máx. 30 s)" else "Usar mi ubicación actual")
                         }
+
+                        Spacer(Modifier.height(4.dp))
+                        Text("✍️ O pega coordenadas de Google Maps", fontWeight = FontWeight.Bold)
+                        OutlinedTextField(
+                            value = manualText,
+                            onValueChange = { manualText = it },
+                            label = { Text("Ej: 25.5428, -103.4068") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        OutlinedButton(
+                            onClick = { saveManual() },
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(14.dp)
+                        ) { Text("Guardar coordenadas") }
 
                         Spacer(Modifier.height(8.dp))
                         Text("⭕ Radio: ${radius.roundToInt()} metros", fontWeight = FontWeight.Bold)
@@ -315,6 +407,12 @@ fun RemindEroApp() {
                     "Tip: en ajustes del teléfono desactiva el ahorro de batería para Remindero y así no se duerme.",
                     fontSize = 12.sp,
                     color = Color.White.copy(alpha = 0.5f),
+                    textAlign = TextAlign.Center
+                )
+                Text(
+                    "Remindero v1.1 · Ui con timeout",
+                    fontSize = 11.sp,
+                    color = Cyan.copy(alpha = 0.6f),
                     textAlign = TextAlign.Center
                 )
                 Spacer(Modifier.height(16.dp))
