@@ -1,5 +1,6 @@
 package com.remindero.app
 
+import com.google.android.gms.location.CurrentLocationRequest
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
@@ -69,10 +70,36 @@ import kotlin.math.sqrt
 
 @SuppressLint("MissingPermission")
 fun fetchLocation(ctx: Context, onResult: (Location?) -> Unit) {
+    @SuppressLint("MissingPermission")
+fun fetchLocation(ctx: Context, onResult: (Location?) -> Unit) {
     val client = LocationServices.getFusedLocationProviderClient(ctx)
-    client.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, CancellationTokenSource().token)
-        .addOnSuccessListener { onResult(it) }
-        .addOnFailureListener { onResult(null) }
+
+    fun tryLast() {
+        client.lastLocation
+            .addOnSuccessListener { onResult(it) }
+            .addOnFailureListener { onResult(null) }
+    }
+
+    fun tryBalanced() {
+        val req = CurrentLocationRequest.Builder()
+            .setPriority(Priority.PRIORITY_BALANCED_POWER_ACCURACY)
+            .setDurationMillis(10000)
+            .setMaxUpdateAgeMillis(120000)
+            .build()
+        client.getCurrentLocation(req, CancellationTokenSource().token)
+            .addOnSuccessListener { loc -> if (loc != null) onResult(loc) else tryLast() }
+            .addOnFailureListener { tryLast() }
+    }
+
+    val req = CurrentLocationRequest.Builder()
+        .setPriority(Priority.PRIORITY_HIGH_ACCURACY)
+        .setDurationMillis(15000)
+        .setMaxUpdateAgeMillis(60000)
+        .build()
+    client.getCurrentLocation(req, CancellationTokenSource().token)
+        .addOnSuccessListener { loc -> if (loc != null) onResult(loc) else tryBalanced() }
+        .addOnFailureListener { tryBalanced() }
+}
 }
 
 private fun hasFineLocation(ctx: Context) =
